@@ -1,5 +1,7 @@
 use crate::rede::ip_proibido;
-use crate::tracker::{MAX_PEERS, TrackerEvent, TrackerRequest, TrackerResponse, compact_peers};
+use crate::tracker::{
+    MAX_PEERS, TrackerEvent, TrackerRequest, TrackerResponse, compact_peers, compact_peers6,
+};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -55,11 +57,12 @@ impl UdpTracker {
                 !self.rede_protegida || !ip_proibido(addr.ip()),
                 "UDP tracker resolves to a private or local address"
             );
-            if target.is_none() && addr.is_ipv4() {
+            // BEP 7: prefer IPv4; an IPv6-only tracker is used over IPv6.
+            if target.is_none_or(|t: SocketAddr| t.is_ipv6() && addr.is_ipv4()) {
                 target = Some(addr);
             }
         }
-        let target = target.context("UDP tracker has no IPv4 address")?;
+        let target = target.context("UDP tracker has no address")?;
         let mut response = vec![0; 65536];
         if !self.connection.as_ref().is_some_and(|connection| {
             connection.expires > Instant::now()
@@ -103,8 +106,23 @@ impl UdpTracker {
             "UDP announce response is shorter than 20 bytes"
         );
         let interval = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
-        let peers = compact_peers(&bytes[20..], self.rede_protegida)?;
-        Ok(TrackerResponse { interval, peers })
+        // Over IPv6 the announce answer carries 18-byte entries (BEP 15 with BEP 7).
+        let (peers, peers6) = if target.is_ipv6() {
+            (
+                Vec::new(),
+                compact_peers6(&bytes[20..], self.rede_protegida)?,
+            )
+        } else {
+            (
+                compact_peers(&bytes[20..], self.rede_protegida)?,
+                Vec::new(),
+            )
+        };
+        Ok(TrackerResponse {
+            interval,
+            peers,
+            peers6,
+        })
     }
 }
 
@@ -116,7 +134,11 @@ fn random_id() -> Result<[u8; 4]> {
 }
 
 async fn connect(target: SocketAddr, response: &mut [u8]) -> Result<Connection> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+    let socket = if target.is_ipv6() {
+        UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).await?
+    } else {
+        UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?
+    };
     socket.connect(target).await?;
     let mut packet = [0; 16];
     packet[..8].copy_from_slice(&PROTOCOL_ID.to_be_bytes());
@@ -253,6 +275,55 @@ mod tests {
             assert_eq!(response.interval, 30);
             assert!(response.peers.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn f17_tracker_udp_so_ipv6_devolve_peers_de_18_bytes() {
+        let deadline = Duration::from_secs(2);
+        let Ok(socket) = TestSocket::bind("[::1]:0") else {
+            println!("sem IPv6 de loopback nesta máquina: teste pulado");
+            return;
+        };
+        socket.set_read_timeout(Some(deadline)).unwrap();
+        let url = Url::parse(&format!("udp://{}", socket.local_addr().unwrap())).unwrap();
+        let mut tracker = UdpTracker::new(url, false).unwrap();
+        let server = thread::spawn(move || {
+            let mut packet = [0; 128];
+            let (len, client) = socket.recv_from(&mut packet).unwrap();
+            assert_eq!(len, 16);
+            assert!(client.is_ipv6(), "connect tem de sair por IPv6");
+            let mut connected = [0; 16];
+            connected[4..8].copy_from_slice(&packet[12..16]);
+            connected[8..].copy_from_slice(&42u64.to_be_bytes());
+            socket.send_to(&connected, client).unwrap();
+            let (len, _) = socket.recv_from(&mut packet).unwrap();
+            assert_eq!(len, 98);
+            let mut reply = vec![0; 20];
+            reply[3] = 1;
+            reply[4..8].copy_from_slice(&packet[12..16]);
+            reply[11] = 30;
+            reply.extend_from_slice(
+                &"2001:db8::7"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+            );
+            reply.extend_from_slice(&6881u16.to_be_bytes());
+            socket.send_to(&reply, client).unwrap();
+        });
+        let response = timeout(deadline, tracker.announce(&request()))
+            .await
+            .unwrap()
+            .unwrap();
+        server.join().unwrap();
+        assert!(response.peers.is_empty());
+        assert_eq!(
+            response.peers6,
+            ["[2001:db8::7]:6881"
+                .parse::<std::net::SocketAddrV6>()
+                .unwrap()]
+        );
+        println!("UDP em IPv6: connect e announce por [::1], 1 aparelho IPv6 de 18 bytes");
     }
 
     #[tokio::test]

@@ -31,8 +31,8 @@ Use `--disable-dht` to turn off DHT traffic or repeat `--dht-bootstrap host:port
 to supply your own bootstrap nodes. Private torrents require a usable tracker or
 an explicit CLI `--peer`.
 
-Each download connects to one peer at a time. Automatic peer discovery is
-IPv4-only. Pure v2 torrents are rejected, and hybrid torrents use their v1 data.
+Each download uses up to 50 peers at once, plus web seeds (BEP 19). Peers come
+from trackers (IPv4 and IPv6), DHT (IPv4), and PEX on public torrents. Pure v2 torrents are rejected, and hybrid torrents use their v1 data.
 Uploading and seeding are unavailable.
 
 ## Requirements

@@ -44,6 +44,12 @@ pub fn ip_proibido(ip: IpAddr) -> bool {
     }
 }
 
+/// Filter for every peer address learned from the network (tracker, DHT, PEX):
+/// no port 0, no unspecified address, no private or local address on a protected network.
+pub fn endereco_aceito(peer: &std::net::SocketAddr, rede_protegida: bool) -> bool {
+    peer.port() != 0 && !peer.ip().is_unspecified() && (!rede_protegida || !ip_proibido(peer.ip()))
+}
+
 pub fn host_proibido(url: &Url) -> bool {
     match url.host() {
         Some(Host::Ipv4(ip)) => ip_proibido(ip.into()),
@@ -83,6 +89,28 @@ impl Resolve for ResolvedorProtegido {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f16_endereco_aceito_filtra_como_tracker_e_dht() {
+        let ok: std::net::SocketAddr = "8.8.8.8:6881".parse().unwrap();
+        assert!(endereco_aceito(&ok, true));
+        assert!(!endereco_aceito(&"8.8.8.8:0".parse().unwrap(), false));
+        assert!(!endereco_aceito(&"0.0.0.0:6881".parse().unwrap(), false));
+        assert!(!endereco_aceito(&"[::]:6881".parse().unwrap(), false));
+        assert!(!endereco_aceito(
+            &"192.168.0.10:6881".parse().unwrap(),
+            true
+        ));
+        assert!(endereco_aceito(
+            &"192.168.0.10:6881".parse().unwrap(),
+            false
+        ));
+        assert!(!endereco_aceito(&"[fd00::1]:6881".parse().unwrap(), true));
+        assert!(endereco_aceito(
+            &"[2001:db8::1]:6881".parse().unwrap(),
+            true
+        ));
+    }
 
     #[test]
     fn classifica_ips() {

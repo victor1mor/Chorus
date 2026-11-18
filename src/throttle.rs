@@ -24,10 +24,9 @@ impl RateLimiter {
         }
     }
 
-    pub fn wait_for_sync(&self, bytes: u64) {
-        if let Some(duration) = self.calculate_sleep(bytes) {
-            std::thread::sleep(duration);
-        }
+    /// Reserves `bytes` now and returns how long the caller must wait before using them.
+    pub(crate) fn reservar(&self, bytes: u64) -> std::time::Duration {
+        self.calculate_sleep(bytes).unwrap_or_default()
     }
 
     fn calculate_sleep(&self, bytes: u64) -> Option<std::time::Duration> {

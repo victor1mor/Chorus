@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-18
+
+### Added
+
+- Download from up to 50 peers at the same time, several pieces per peer, with a request queue sized to 3 s of each peer's measured speed (5 to 250 requests).
+- Fast extension (BEP 6) and the peer's `reqq` limit (BEP 10).
+- Peer exchange (BEP 11) on public torrents, through the same address filter as trackers and DHT. Never on private torrents.
+- IPv6 peers (BEP 7) from HTTP and UDP trackers.
+- Web seeds (BEP 19) over the protected HTTP client, with SHA-1 checked before any write.
+
+### Changed
+
+- The bandwidth limit applies before each request instead of after each block. A peer that chokes us is no longer dropped; blocks have a 20 s deadline and silent peers a 120 s one.
+- A peer that sends corrupt pieces is banned for the whole download (by IP and port; three banned ports ban the IP).
+
+### BitTorrent limits
+
+- Uploading and seeding are unavailable; Chorus never uploads pieces. DHT discovery is IPv4-only. Pure v2 torrents are rejected, and hybrid torrents use their v1 data.
+- Web seeds use HTTP(S) only; FTP, BEP 17 `httpseeds` and magnet `ws=` are not supported.
+
 ## [0.3.0] - 2026-11-14
 
 ### Added

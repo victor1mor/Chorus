@@ -7,8 +7,11 @@ use crate::job::{ErrorCategory, JobManifest, JobPrivateData, JobRegistry, JobSta
 use crate::magnet::MagnetLink;
 use crate::metadata_transfer::MetadataTransfer;
 use crate::metainfo::{Info, Metainfo};
-use crate::peer_transfer::{PeerReader, PeerTransfer};
+use crate::peer_transfer::{
+    AparelhoHostil, EventoAparelho, PeerJob, PeerTransfer, socket_timeout, tamanho_peca,
+};
 use crate::peer_wire::Handshake;
+use crate::quadro::{AparelhoId, QuadroDePecas};
 use crate::throttle::RateLimiter;
 use crate::torrent_storage::{Layout, TorrentPieceMap, TorrentStorage};
 use crate::tracker::{
@@ -17,20 +20,27 @@ use crate::tracker::{
 };
 use crate::tracker_udp::{self, UdpTracker};
 use anyhow::{Context, Result, anyhow, ensure};
-use futures::{FutureExt, future::join_all};
+use futures::{FutureExt, StreamExt, future::join_all, stream::FuturesUnordered};
 use sha1::{Digest, Sha1};
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::task::JoinSet;
+use tokio::time::timeout;
 
+const MAX_TENTATIVAS: usize = 10;
+const MAX_CONECTADOS: usize = 50;
+const PORTAS_PARA_BANIR_IP: usize = 3;
+const ORCAMENTO_BYTES: u64 = 128 * 1024 * 1024;
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
 const TIMEOUT: Duration = Duration::from_secs(5);
 const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
@@ -106,9 +116,7 @@ fn reconferir(
         if !map.has_piece(index) {
             continue;
         }
-        let length = layout
-            .piece_length
-            .min(layout.total_length - index as u64 * layout.piece_length);
+        let length = tamanho_peca(layout, index);
         piece.resize(length as usize, 0);
         if storage.read_piece(index, &mut piece).is_ok()
             && <[u8; 20]>::from(Sha1::digest(&piece)) == *expected
@@ -188,29 +196,67 @@ async fn with_announces<T>(
     trackers: &mut [Tracker],
     request: &TrackerRequest,
     tx: mpsc::UnboundedSender<Result<TrackerResponse>>,
-    consume: impl Future<Output = T>,
+    consume: impl Future<Output = (T, Option<TrackerRequest>)>,
 ) -> T {
-    let announce = async move {
-        join_all(trackers.iter_mut().map(|tracker| {
-            let tx = &tx;
+    let mut pending: FuturesUnordered<_> = trackers
+        .iter_mut()
+        .map(|tracker| {
+            let tx = tx.clone();
             async move {
-                let result =
-                    match tokio::time::timeout(ANNOUNCE_TIMEOUT, tracker.announce(request)).await {
-                        Ok(result) => result,
-                        Err(err) => Err(err.into()),
-                    };
-                // Let healthy trackers supply peers while slow announces are still in flight.
+                let result = match timeout(ANNOUNCE_TIMEOUT, tracker.announce(request)).await {
+                    Ok(result) => result,
+                    Err(err) => Err(err.into()),
+                };
                 let _ = tx.send(result);
+                tracker
             }
-        }))
-        .await;
+        })
+        .collect();
+    drop(tx);
+    let mut ready = Vec::new();
+    let (result, final_request) = {
+        tokio::pin!(consume);
+        loop {
+            tokio::select! {
+                biased;
+                Some(tracker) = pending.next() => ready.push(tracker),
+                result = &mut consume => break result,
+            }
+        }
     };
-    tokio::pin!(consume);
-    tokio::select! {
-        biased;
-        () = announce => consume.await,
-        result = &mut consume => result,
-    }
+    let _ = timeout(TIMEOUT, async {
+        if let Some(request) = &final_request {
+            let mut final_announces: FuturesUnordered<_> =
+                ready.into_iter().map(|tracker| tracker.announce(request)).collect();
+            loop {
+                tokio::select! {
+                    Some(tracker) = pending.next() => final_announces.push(tracker.announce(request)),
+                    Some(_) = final_announces.next() => {}
+                    else => break,
+                }
+            }
+        } else {
+            while pending.next().await.is_some() {}
+        }
+    }).await;
+    result
+}
+
+async fn save_piece_map(
+    storage: &Arc<TorrentStorage>,
+    map: &TorrentPieceMap,
+    directory: &Path,
+    id: &str,
+) -> Result<(), (ErrorCategory, anyhow::Error)> {
+    let storage = Arc::clone(storage);
+    let map = map.clone();
+    let directory = directory.to_path_buf();
+    let id = id.to_owned();
+    tokio::task::spawn_blocking(move || storage.sync_all().and_then(|()| map.save(&directory, &id)))
+        .await
+        .map_err(|err| (ErrorCategory::Internal, err.into()))?
+        .map(|_| ())
+        .map_err(|err| (ErrorCategory::Storage, err))
 }
 
 async fn baixar_metadados(
@@ -250,9 +296,7 @@ async fn baixar_metadados(
                 Ok(response) => {
                     peers.extend(
                         response
-                            .peers
-                            .into_iter()
-                            .map(SocketAddr::V4)
+                            .todos()
                             .filter(|peer| seen.insert(*peer))
                             .take(remaining),
                     );
@@ -313,6 +357,78 @@ fn bytes_no_mapa(map: &TorrentPieceMap, layout: &Layout) -> u64 {
     pieces * layout.piece_length - missing_tail
 }
 
+/// PEX (BEP 11) addresses go through the same filter as tracker and DHT addresses.
+fn enfileirar_descobertos(
+    novos: Vec<SocketAddr>,
+    peers: &mut VecDeque<SocketAddr>,
+    seen: &mut HashSet<SocketAddr>,
+    banidos: &HashSet<SocketAddr>,
+    ips_banidos: &HashSet<IpAddr>,
+    remaining: &mut usize,
+    rede_protegida: bool,
+) {
+    for peer in novos {
+        if *remaining == 0 {
+            break;
+        }
+        if crate::rede::endereco_aceito(&peer, rede_protegida)
+            && !aparelho_banido(&peer, banidos, ips_banidos)
+            && seen.insert(peer)
+        {
+            peers.push_back(peer);
+            *remaining -= 1;
+        }
+    }
+}
+
+fn aparelho_banido(
+    peer: &SocketAddr,
+    banidos: &HashSet<SocketAddr>,
+    ips_banidos: &HashSet<IpAddr>,
+) -> bool {
+    banidos.contains(peer) || ips_banidos.contains(&peer.ip())
+}
+
+async fn baixar_de_aparelho(
+    peer: SocketAddr,
+    handshake: Handshake,
+    tentativa: OwnedSemaphorePermit,
+    id: AparelhoId,
+    job: Arc<PeerJob>,
+    eventos: mpsc::UnboundedSender<EventoAparelho>,
+) -> Result<()> {
+    let (mut stream, remoto) = {
+        let _tentativa = tentativa;
+        let mut stream = timeout(TIMEOUT, tokio::net::TcpStream::connect(peer))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection timed out"))??;
+        let remoto = timeout(TIMEOUT, async {
+            handshake.write_async(&mut stream).await?;
+            Handshake::read_async(&mut stream, &handshake.info_hash, &handshake.peer_id).await
+        })
+        .await
+        .map_err(|_| socket_timeout())??;
+        (stream, remoto)
+    };
+    {
+        let mut quadro = job.quadro.lock().unwrap();
+        quadro.entrou(id)?;
+    }
+    let _ = eventos.send(EventoAparelho::Conectou);
+    // BEP 6 and BEP 10 only when both sides set the reserved bit.
+    let fast = handshake.supports_fast && remoto.supports_fast;
+    let extensao = handshake.supports_extension && remoto.supports_extension;
+    let result = PeerTransfer::new(&mut stream, &job, id, &eventos)
+        .com_extensoes(fast, extensao)
+        .download()
+        .await;
+    {
+        let mut quadro = job.quadro.lock().unwrap();
+        quadro.saiu(id)?;
+    }
+    result
+}
+
 pub async fn executar(
     mut private: JobPrivateData,
     job: &JobManifest,
@@ -341,7 +457,7 @@ pub async fn executar(
     tokio::pin!(watch);
 
     let mut peer_id = [0; 20];
-    peer_id[..8].copy_from_slice(b"-CH0300-");
+    peer_id[..8].copy_from_slice(b"-CH0400-");
     getrandom::fill(&mut peer_id[8..]).map_err(|err| {
         (
             ErrorCategory::Internal,
@@ -401,14 +517,16 @@ pub async fn executar(
             .map_err(|err| (ErrorCategory::Internal, err))?;
             request.info_hash = magnet.info_hash;
             let (tx, rx) = mpsc::unbounded_channel();
-            let (metadata, peer, from_dht) = tokio::select! {
-                biased;
-                () = &mut watch => return Err(cancelled()),
-                result = with_announces(&mut trackers, &request, tx,
-                    baixar_metadados(&manual_peers, rx, &request, &cancel_flag,
+            let (metadata, peer, from_dht) = with_announces(&mut trackers, &request, tx, async {
+                let result = tokio::select! {
+                    biased;
+                    () = &mut watch => Err(cancelled()),
+                    result = baixar_metadados(&manual_peers, rx, &request, &cancel_flag,
                         dht.as_ref().map(|node| node.peers(magnet.info_hash, &[],
-                            &args.dht_bootstrap, args.job_dir.as_deref(), rede_protegida)))) => result?,
-            };
+                            &args.dht_bootstrap, args.job_dir.as_deref(), rede_protegida))) => result,
+                };
+                (result, None)
+            }).await?;
             save_magnet_torrent(&path, &magnet.trackers, &metadata).map_err(storage_error)?;
             metadata_peer = Some((peer, from_dht));
             metadata_trackers = Some(trackers);
@@ -469,15 +587,15 @@ pub async fn executar(
             .filter(|map| map.matches_piece_count(num_pieces))
             .unwrap_or_else(|| TorrentPieceMap::new(num_pieces))
     } else {
-        let map = TorrentPieceMap::new(num_pieces);
-        map.save(directory, &job.id)
-            .map_err(|err| (ErrorCategory::Storage, err))?;
-        map
+        TorrentPieceMap::new(num_pieces)
     };
     let storage = Arc::new(
         TorrentStorage::new(&job.output, &metainfo.info)
             .map_err(|err| (ErrorCategory::Storage, err))?,
     );
+    if !resuming {
+        save_piece_map(&storage, &map, directory, &job.id).await?;
+    }
     let resumed_bytes = if resuming {
         let metainfo = Arc::clone(&metainfo);
         let storage = Arc::clone(&storage);
@@ -526,11 +644,32 @@ pub async fn executar(
         0
     };
 
-    let job_limiter = Arc::new(RateLimiter::new(args.limit_rate));
+    let quadro = QuadroDePecas::new(
+        (0..num_pieces)
+            .map(|index| tamanho_peca(&layout, index))
+            .collect(),
+        &map,
+        ORCAMENTO_BYTES,
+        None,
+    )
+    .map_err(|err| (ErrorCategory::Internal, err))?;
+    let n = std::thread::available_parallelism().map_or(1, usize::from);
+    let peers_job = Arc::new(PeerJob {
+        quadro: Mutex::new(quadro),
+        storage: Arc::clone(&storage),
+        layout: Arc::clone(&layout),
+        hashes: hashes.clone(),
+        semaforo: Arc::new(Semaphore::new(n)),
+        global_limiter,
+        job_limiter: RateLimiter::new(args.limit_rate),
+        // BEP 27: no PEX on a private torrent.
+        pex: !is_private,
+    });
     let handshake = Handshake {
         info_hash: metainfo.info_hash,
         peer_id,
-        supports_extension: false,
+        supports_extension: true,
+        supports_fast: true,
     };
 
     let mut trackers = match metadata_trackers {
@@ -544,158 +683,263 @@ pub async fn executar(
     };
     request.info_hash = handshake.info_hash;
     request.left = layout.total_length - resumed_bytes;
-    let mut attempted = false;
-    let result = async {
-        let mut last_error = anyhow!("no peer completed the torrent");
-        for round in 0..3 {
-            let round_request = TrackerRequest { ..request };
-            let (tx, mut rx) = mpsc::unbounded_channel();
-            let mut interval = None;
-            let mut peers = VecDeque::from(manual_peers.clone());
-            let mut seen: HashSet<_> = manual_peers.iter().copied().collect();
-            let mut remaining = MAX_PEERS;
-            let mut round_dht = dht;
-            attempted = !trackers.is_empty();
-            let (updated_map, completed) =
-                with_announces(&mut trackers, &round_request, tx, async {
-                    loop {
-                        let Some(peer) = peers.pop_front() else {
-                            let response = tokio::select! {
-                                biased;
-                                () = &mut watch => return Err(cancelled()),
-                                response = rx.recv() => response,
-                            };
+    let mut last_error = anyhow!("no peer completed the torrent");
+    let mut banidos: HashSet<SocketAddr> = HashSet::new();
+    let mut ips_banidos: HashSet<IpAddr> = HashSet::new();
+    let mut downloaded = resumed_bytes;
+    let mut checkpoint_bytes = downloaded;
+    let mut last_checkpoint = tokio::time::Instant::now();
+    // BEP 19: web seeds from `url-list`, through the protected HTTP client.
+    let semeadores_web =
+        crate::semeador_web::semeadores_validos(&metainfo.url_list, rede_protegida);
+    let fetcher_web = HttpFetcher::new(
+        Some(std::time::Duration::from_secs(10)),
+        Some(std::time::Duration::from_secs(30)),
+        None,
+        rede_protegida,
+    )
+    .map_err(|err| (ErrorCategory::Internal, err))?;
+    let mut next_id: AparelhoId = 0;
+    let registrar_peca = |index, map: &mut TorrentPieceMap, downloaded: &mut u64| {
+        map.set_piece(index);
+        *downloaded += tamanho_peca(&layout, index);
+        broker.emit(EventType::Progress {
+            id: job.id.clone(),
+            bytes_downloaded: *downloaded,
+            bytes_total: Some(layout.total_length),
+        });
+    };
+    for round in 0..3 {
+        let round_request = TrackerRequest { ..request };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (eventos, mut eventos_rx) = mpsc::unbounded_channel();
+        let mut aparelhos = JoinSet::new();
+        let mut web = JoinSet::new();
+        for base in &semeadores_web {
+            next_id += 1;
+            web.spawn(crate::semeador_web::semear_web(
+                base.clone(),
+                fetcher_web.clone(),
+                next_id,
+                Arc::clone(&peers_job),
+                eventos.clone(),
+            ));
+        }
+        let tentativas = Arc::new(Semaphore::new(MAX_TENTATIVAS));
+        let mut interval = None;
+        let mut seen = HashSet::new();
+        let mut peers: VecDeque<_> = manual_peers
+            .iter()
+            .copied()
+            .filter(|peer| !aparelho_banido(peer, &banidos, &ips_banidos) && seen.insert(*peer))
+            .collect();
+        let mut remaining = MAX_PEERS;
+        let mut round_dht = dht;
+        let mut tracker_closed = false;
+        let completed = with_announces(&mut trackers, &round_request, tx, async {
+            let result = async {
+                loop {
+                    let completo = { peers_job.quadro.lock().unwrap().completo() };
+                    if completo && downloaded == layout.total_length {
+                        return Ok(true);
+                    }
+
+                    // Reserve a connection slot while its handshake is in flight.
+                    while aparelhos.len() < MAX_CONECTADOS && !peers.is_empty() {
+                        let Ok(tentativa) = Arc::clone(&tentativas).try_acquire_owned() else {
+                            break;
+                        };
+                        let peer = peers.pop_front().expect("queued peer");
+                        next_id += 1;
+                        let id = next_id;
+                        let handshake = handshake.clone();
+                        let peers_job = Arc::clone(&peers_job);
+                        let eventos = eventos.clone();
+                        aparelhos.spawn(async move {
+                            let result = baixar_de_aparelho(peer, handshake, tentativa, id, peers_job, eventos).await;
+                            (peer, result)
+                        });
+                    }
+
+                    if tracker_closed && peers.is_empty() && aparelhos.is_empty() && web.is_empty() {
+                        let Some(node) = round_dht.take() else {
+                            return Ok(false);
+                        };
+                        let found = tokio::select! {
+                            biased;
+                            () = &mut watch => return Err(cancelled()),
+                            peers = node.peers(handshake.info_hash, &metainfo.nodes,
+                                &args.dht_bootstrap, args.job_dir.as_deref(), rede_protegida) => peers,
+                        };
+                        peers.extend(found.into_iter().filter(|peer| !aparelho_banido(peer, &banidos, &ips_banidos) && seen.insert(*peer)));
+                        continue;
+                    }
+
+                    tokio::select! {
+                        biased;
+                        () = &mut watch => return Err(cancelled()),
+                        () = tokio::time::sleep_until(last_checkpoint + CHECKPOINT_INTERVAL),
+                            if downloaded != checkpoint_bytes => {
+                            save_piece_map(&storage, &map, directory, &job.id).await?;
+                            last_checkpoint = tokio::time::Instant::now();
+                            checkpoint_bytes = downloaded;
+                        }
+                        Some(evento) = eventos_rx.recv() => {
+                            match evento {
+                                EventoAparelho::Gravou(index) => registrar_peca(index, &mut map, &mut downloaded),
+                                EventoAparelho::Descobriu(novos) => enfileirar_descobertos(
+                                    novos, &mut peers, &mut seen, &banidos, &ips_banidos, &mut remaining, rede_protegida,
+                                ),
+                                EventoAparelho::Conectou => {}
+                            }
+                        }
+                        Some(resultado) = web.join_next() => {
+                            match resultado {
+                                Ok(Err(err)) => last_error = err,
+                                Err(err) if !err.is_cancelled() => {
+                                    return Err((ErrorCategory::Internal, err.into()));
+                                }
+                                _ => {}
+                            }
+                        }
+                        Some(result) = aparelhos.join_next() => {
+                            match result {
+                                Ok((_, Ok(()))) => {}
+                                Ok((_, Err(err))) if err.is::<tokio::task::JoinError>() => {
+                                    return Err((ErrorCategory::Internal, err));
+                                }
+                                Ok((peer, Err(err))) => {
+                                    if err.is::<AparelhoHostil>() && banidos.insert(peer) {
+                                        let ip = peer.ip();
+                                        // ponytail: varre os banidos por expulsão; indexar por IP se o enxame exigir.
+                                        let portas: HashSet<_> = banidos.iter()
+                                            .filter_map(|peer| (peer.ip() == ip).then_some(peer.port()))
+                                            .collect();
+                                        if portas.len() == PORTAS_PARA_BANIR_IP {
+                                            ips_banidos.insert(ip);
+                                            peers.retain(|peer| peer.ip() != ip);
+                                        }
+                                    }
+                                    last_error = err;
+                                }
+                                Err(err) => return Err((ErrorCategory::Internal, err.into())),
+                            }
+                        }
+                        response = rx.recv(), if !tracker_closed => {
                             match response {
                                 Some(Ok(response)) => {
                                     let seconds = u64::from(response.interval.clamp(1, 120));
                                     // ponytail: one delay for the round; use per-tracker timers if tiers need independent retries.
                                     interval = Some(interval.unwrap_or(0).max(seconds));
+                                    let before = peers.len();
                                     peers.extend(
-                                        response
-                                            .peers
-                                            .into_iter()
-                                            .map(SocketAddr::V4)
-                                            .filter(|peer| seen.insert(*peer))
-                                            .take(remaining),
+                                        response.todos()
+                                            .filter(|peer| !aparelho_banido(peer, &banidos, &ips_banidos) && seen.insert(*peer)).take(remaining),
                                     );
-                                    remaining -= peers.len();
+                                    remaining -= peers.len() - before;
                                 }
                                 Some(Err(err)) => last_error = err,
-                                None => {
-                                    let Some(node) = round_dht.take() else {
-                                        return Ok((map, false));
-                                    };
-                                    let found = tokio::select! {
-                                        biased;
-                                        () = &mut watch => return Err(cancelled()),
-                                        peers = node.peers(handshake.info_hash, &metainfo.nodes,
-                                            &args.dht_bootstrap, args.job_dir.as_deref(), rede_protegida) => peers,
-                                    };
-                                    peers.extend(found.into_iter().filter(|peer| seen.insert(*peer)));
-                                }
+                                None => tracker_closed = true,
                             }
-                            continue;
-                        };
-                        let handshake = handshake.clone();
-                        let peer_storage = Arc::clone(&storage);
-                        let metainfo = Arc::clone(&metainfo);
-                        let flag = Arc::clone(&cancel_flag);
-                        let broker = broker.clone();
-                        let id = job.id.clone();
-                        let map_directory = directory.to_path_buf();
-                        let global_limiter = Arc::clone(&global_limiter);
-                        let job_limiter = Arc::clone(&job_limiter);
-                        let mut transfer = tokio::task::spawn_blocking(move || {
-                            let result = (|| -> Result<()> {
-                                ensure!(!flag.load(Ordering::Relaxed), "Cancelled");
-                                let mut stream = TcpStream::connect_timeout(&peer, TIMEOUT)?;
-                                stream.set_write_timeout(Some(TIMEOUT))?;
-                                handshake.write_to(&mut stream)?;
-                                Handshake::read_from(
-                                    &mut PeerReader {
-                                        stream: &mut stream,
-                                        deadline: Instant::now() + TIMEOUT,
-                                        cancel_flag: Some(&flag),
-                                    },
-                                    &handshake.info_hash,
-                                    &handshake.peer_id,
-                                )?;
-                                PeerTransfer::new(
-                                    &mut stream,
-                                    &peer_storage,
-                                    &mut map,
-                                    &metainfo.info,
-                                    Some(&global_limiter),
-                                    Some(&job_limiter),
-                                    Some(flag),
-                                )
-                                .with_events(&broker, id.clone())
-                                .with_piece_map(&map_directory, &id)
-                                .download()
-                            })();
-                            let saved = peer_storage
-                                .sync_all()
-                                .and_then(|()| map.save(&map_directory, &id));
-                            (map, result, saved)
-                        });
-                        let (updated_map, result, saved) = tokio::select! {
-                            biased;
-                            () = &mut watch => transfer.await,
-                            joined = &mut transfer => joined,
-                        }
-                        .map_err(|err| (ErrorCategory::Internal, err.into()))?;
-                        map = updated_map;
-                        if attempted {
-                            let downloaded = bytes_no_mapa(&map, &layout);
-                            request.downloaded = downloaded - resumed_bytes;
-                            request.left = layout.total_length - downloaded;
-                        }
-                        if cancel_flag.load(Ordering::Relaxed) {
-                            return Err(cancelled());
-                        }
-                        saved.map_err(|err| (ErrorCategory::Storage, err))?;
-                        match result {
-                            Ok(()) => return Ok((map, true)),
-                            Err(err) => last_error = err,
                         }
                     }
-                })
-                .await?;
-            if completed {
-                return Ok(());
+                }
+            }.await;
+            aparelhos.shutdown().await;
+            web.shutdown().await;
+            {
+                let _drenado = peers_job.semaforo.acquire_many(n as u32).await
+                    .expect("semaphore never closes");
             }
-            map = updated_map;
-            let Some(seconds) = interval.filter(|_| round < 2) else {
-                break;
+            while let Ok(evento) = eventos_rx.try_recv() {
+                if let EventoAparelho::Gravou(index) = evento {
+                    registrar_peca(index, &mut map, &mut downloaded);
+                }
+            }
+            let result = if matches!(result, Ok(false)) && round < 2 && interval.is_some() {
+                result
+            } else {
+                let saved = save_piece_map(&storage, &map, directory, &job.id).await;
+                if cancel_flag.load(Ordering::Relaxed) { result } else { saved.and(result) }
             };
-            tokio::select! {
-                biased;
-                () = &mut watch => return Err(cancelled()),
-                () = tokio::time::sleep(Duration::from_secs(seconds)) => {}
-            }
-            request.event = TrackerEvent::None;
+            let verified = bytes_no_mapa(&map, &layout);
+            request.downloaded = verified - resumed_bytes;
+            request.left = layout.total_length - verified;
+            let event = match &result {
+                Ok(true) => Some(TrackerEvent::Completed),
+                Err(_) => Some(TrackerEvent::Stopped),
+                Ok(false) if round == 2 || interval.is_none() => Some(TrackerEvent::Stopped),
+                Ok(false) => None,
+            };
+            (result, event.map(|event| TrackerRequest { event, ..request }))
+        }).await?;
+        if completed {
+            return Ok(());
         }
-        Err((ErrorCategory::Network, last_error))
+        let Some(seconds) = interval.filter(|_| round < 2) else {
+            break;
+        };
+        tokio::select! {
+            biased;
+            () = &mut watch => {
+                let _ = save_piece_map(&storage, &map, directory, &job.id).await;
+                let stopped = TrackerRequest { event: TrackerEvent::Stopped, ..request };
+                let _ = timeout(TIMEOUT, join_all(trackers.iter_mut().map(|tracker| tracker.announce(&stopped)))).await;
+                return Err(cancelled());
+            },
+            () = tokio::time::sleep(Duration::from_secs(seconds)) => {}
+        }
+        request.event = TrackerEvent::None;
     }
-    .await;
-
-    request.event = if result.is_ok() {
-        TrackerEvent::Completed
-    } else {
-        TrackerEvent::Stopped
-    };
-    if attempted {
-        let final_announces = trackers
-            .iter_mut()
-            .map(|tracker| tracker.announce(&request));
-        let _ = tokio::time::timeout(TIMEOUT, join_all(final_announces)).await;
-    }
-    result
+    Err((ErrorCategory::Network, last_error))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f16_pex_passa_pelo_filtro_banidos_repetidos_e_teto() {
+        let novos: Vec<SocketAddr> = [
+            "8.8.8.8:1",
+            "8.8.8.8:1",
+            "8.8.8.8:0",
+            "192.168.0.2:1",
+            "9.9.9.9:1",
+            "7.7.7.7:1",
+            "[2001:db8::1]:1",
+            "1.1.1.1:1",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        let mut peers = VecDeque::new();
+        let mut seen = HashSet::new();
+        let banidos = HashSet::from(["9.9.9.9:1".parse().unwrap()]);
+        let ips_banidos = HashSet::from(["7.7.7.7".parse().unwrap()]);
+        let mut remaining = 2;
+        enfileirar_descobertos(
+            novos,
+            &mut peers,
+            &mut seen,
+            &banidos,
+            &ips_banidos,
+            &mut remaining,
+            true,
+        );
+        let esperado: Vec<SocketAddr> = vec![
+            "8.8.8.8:1".parse().unwrap(),
+            "[2001:db8::1]:1".parse().unwrap(),
+        ];
+        assert_eq!(Vec::from(peers), esperado);
+        assert_eq!(
+            remaining, 0,
+            "teto de aparelhos respeitado: 1.1.1.1 ficou de fora"
+        );
+        println!(
+            "PEX: repetido, porta 0, IP privado, banido e IP banido filtrados; teto respeitado"
+        );
+    }
     use crate::metainfo::SingleFileInfo;
 
     #[test]

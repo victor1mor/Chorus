@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::io::{Error, ErrorKind, Read, Write};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const BITTORRENT_PROTOCOL: &[u8; 19] = b"BitTorrent protocol";
 pub const MAX_MESSAGE_SIZE: u32 = 1024 * 1024; // 1MB, prevents malicious huge lengths
@@ -10,10 +11,20 @@ pub struct Handshake {
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
     pub supports_extension: bool,
+    /// BEP 6 (Fast extension): reserved[7] & 0x04.
+    pub supports_fast: bool,
 }
 
 impl Handshake {
     pub fn write_to(&self, stream: &mut impl Write) -> std::io::Result<()> {
+        stream.write_all(&self.bytes())
+    }
+
+    pub async fn write_async(&self, stream: &mut (impl AsyncWrite + Unpin)) -> std::io::Result<()> {
+        stream.write_all(&self.bytes()).await
+    }
+
+    fn bytes(&self) -> [u8; 68] {
         let mut buf = [0u8; 68];
         buf[0] = 19;
         buf[1..20].copy_from_slice(BITTORRENT_PROTOCOL);
@@ -21,9 +32,12 @@ impl Handshake {
         if self.supports_extension {
             buf[25] |= 0x10;
         }
+        if self.supports_fast {
+            buf[27] |= 0x04;
+        }
         buf[28..48].copy_from_slice(&self.info_hash);
         buf[48..68].copy_from_slice(&self.peer_id);
-        stream.write_all(&buf)
+        buf
     }
 
     pub fn read_from(
@@ -33,7 +47,24 @@ impl Handshake {
     ) -> std::io::Result<Self> {
         let mut buf = [0u8; 68];
         stream.read_exact(&mut buf)?;
+        Self::decode(&buf, expected_info_hash, local_peer_id)
+    }
 
+    pub async fn read_async(
+        stream: &mut (impl AsyncRead + Unpin),
+        expected_info_hash: &[u8; 20],
+        local_peer_id: &[u8; 20],
+    ) -> std::io::Result<Self> {
+        let mut buf = [0u8; 68];
+        read_exact_async(stream, &mut buf).await?;
+        Self::decode(&buf, expected_info_hash, local_peer_id)
+    }
+
+    fn decode(
+        buf: &[u8; 68],
+        expected_info_hash: &[u8; 20],
+        local_peer_id: &[u8; 20],
+    ) -> std::io::Result<Self> {
         if buf[0] != 19 || &buf[1..20] != BITTORRENT_PROTOCOL {
             return Err(Error::new(
                 ErrorKind::InvalidData,
@@ -59,11 +90,13 @@ impl Handshake {
         }
 
         let supports_extension = (buf[25] & 0x10) != 0;
+        let supports_fast = (buf[27] & 0x04) != 0;
 
         Ok(Handshake {
             info_hash,
             peer_id,
             supports_extension,
+            supports_fast,
         })
     }
 }
@@ -94,28 +127,49 @@ pub enum PeerMessage {
     },
     Port(u16),
     Extended(u8, Vec<u8>),
+    // BEP 6 (Fast extension). Only valid when both sides set the reserved bit.
+    SuggestPiece(u32),
+    HaveAll,
+    HaveNone,
+    RejectRequest {
+        index: u32,
+        begin: u32,
+        length: u32,
+    },
+    AllowedFast(u32),
 }
 
 impl PeerMessage {
     pub fn read_from(stream: &mut impl Read) -> std::io::Result<Self> {
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf)?;
-        let len = u32::from_be_bytes(len_buf);
-
-        if len == 0 {
-            return Ok(PeerMessage::KeepAlive);
+        let mut msg_buf = vec![0; Self::message_length(len_buf)?];
+        if !msg_buf.is_empty() {
+            stream.read_exact(&mut msg_buf)?;
         }
+        Self::decode(&msg_buf)
+    }
 
+    pub async fn read_async(stream: &mut (impl AsyncRead + Unpin)) -> std::io::Result<Self> {
+        let mut len_buf = [0u8; 4];
+        read_exact_async(stream, &mut len_buf).await?;
+        let mut msg_buf = vec![0; Self::message_length(len_buf)?];
+        read_exact_async(stream, &mut msg_buf).await?;
+        Self::decode(&msg_buf)
+    }
+
+    fn message_length(len_buf: [u8; 4]) -> std::io::Result<usize> {
+        let len = u32::from_be_bytes(len_buf);
         if len > MAX_MESSAGE_SIZE {
             return Err(Error::new(ErrorKind::InvalidData, "Message too large"));
         }
+        Ok(len as usize)
+    }
 
-        let mut msg_buf = vec![0u8; len as usize];
-        stream.read_exact(&mut msg_buf)?;
-
-        let id = msg_buf[0];
-        let payload = &msg_buf[1..];
-
+    fn decode(msg_buf: &[u8]) -> std::io::Result<Self> {
+        let Some((&id, payload)) = msg_buf.split_first() else {
+            return Ok(PeerMessage::KeepAlive);
+        };
         match id {
             0 => Ok(PeerMessage::Choke),
             1 => Ok(PeerMessage::Unchoke),
@@ -178,6 +232,37 @@ impl PeerMessage {
                 let port = u16::from_be_bytes(payload.try_into().unwrap());
                 Ok(PeerMessage::Port(port))
             }
+            13 | 17 => {
+                if payload.len() != 4 {
+                    return Err(Error::new(ErrorKind::InvalidData, "Invalid Fast payload"));
+                }
+                let index = u32::from_be_bytes(payload.try_into().unwrap());
+                Ok(if id == 13 {
+                    PeerMessage::SuggestPiece(index)
+                } else {
+                    PeerMessage::AllowedFast(index)
+                })
+            }
+            14 | 15 => {
+                if !payload.is_empty() {
+                    return Err(Error::new(ErrorKind::InvalidData, "Invalid Fast payload"));
+                }
+                Ok(if id == 14 {
+                    PeerMessage::HaveAll
+                } else {
+                    PeerMessage::HaveNone
+                })
+            }
+            16 => {
+                if payload.len() != 12 {
+                    return Err(Error::new(ErrorKind::InvalidData, "Invalid Reject payload"));
+                }
+                Ok(PeerMessage::RejectRequest {
+                    index: u32::from_be_bytes(payload[0..4].try_into().unwrap()),
+                    begin: u32::from_be_bytes(payload[4..8].try_into().unwrap()),
+                    length: u32::from_be_bytes(payload[8..12].try_into().unwrap()),
+                })
+            }
             20 => {
                 if payload.is_empty() {
                     return Err(Error::new(
@@ -200,7 +285,6 @@ impl PeerMessage {
         match self {
             PeerMessage::KeepAlive => stream.write_all(&[0, 0, 0, 0]),
             PeerMessage::Choke => stream.write_all(&[0, 0, 0, 1, 0]),
-            PeerMessage::Unchoke => stream.write_all(&[0, 0, 0, 1, 1]),
             PeerMessage::Interested => stream.write_all(&[0, 0, 0, 1, 2]),
             PeerMessage::NotInterested => stream.write_all(&[0, 0, 0, 1, 3]),
             PeerMessage::Have(index) => {
@@ -226,6 +310,7 @@ impl PeerMessage {
                 buf.extend_from_slice(&length.to_be_bytes());
                 stream.write_all(&buf)
             }
+            #[cfg(test)]
             PeerMessage::Piece {
                 index,
                 begin,
@@ -263,8 +348,54 @@ impl PeerMessage {
                 buf.extend_from_slice(ext_payload);
                 stream.write_all(&buf)
             }
+            PeerMessage::HaveAll => stream.write_all(&[0, 0, 0, 1, 14]),
+            PeerMessage::HaveNone => stream.write_all(&[0, 0, 0, 1, 15]),
+            PeerMessage::SuggestPiece(index) | PeerMessage::AllowedFast(index) => {
+                let id = if matches!(self, PeerMessage::SuggestPiece(_)) {
+                    13
+                } else {
+                    17
+                };
+                let mut buf = vec![0, 0, 0, 5, id];
+                buf.extend_from_slice(&index.to_be_bytes());
+                stream.write_all(&buf)
+            }
+            PeerMessage::RejectRequest {
+                index,
+                begin,
+                length,
+            } => {
+                let mut buf = vec![0, 0, 0, 13, 16];
+                buf.extend_from_slice(&index.to_be_bytes());
+                buf.extend_from_slice(&begin.to_be_bytes());
+                buf.extend_from_slice(&length.to_be_bytes());
+                stream.write_all(&buf)
+            }
+            _ => Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Message cannot be sent",
+            )),
         }
     }
+
+    pub async fn write_async(&self, stream: &mut (impl AsyncWrite + Unpin)) -> std::io::Result<()> {
+        let mut bytes = Vec::new();
+        self.write_to(&mut bytes)?;
+        stream.write_all(&bytes).await
+    }
+}
+
+async fn read_exact_async(
+    stream: &mut (impl AsyncRead + Unpin),
+    buf: &mut [u8],
+) -> std::io::Result<()> {
+    stream.read_exact(buf).await.map(|_| ()).map_err(|err| {
+        if err.kind() == ErrorKind::UnexpectedEof {
+            Error::new(ErrorKind::UnexpectedEof, "failed to fill whole buffer")
+        } else {
+            err
+        }
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,6 +469,7 @@ mod tests {
                 info_hash: expected_info_hash,
                 peer_id: remote_peer_id,
                 supports_extension: false,
+                supports_fast: false,
             };
             hs_reply.write_to(&mut stream).unwrap();
 
@@ -345,8 +477,8 @@ mod tests {
             let msg = PeerMessage::read_from(&mut stream).unwrap();
             assert_eq!(msg, PeerMessage::Interested);
 
-            // Server replies Unchoke
-            PeerMessage::Unchoke.write_to(&mut stream).unwrap();
+            // The fake peer lets the client send requests.
+            stream.write_all(&[0, 0, 0, 1, 1]).unwrap();
         });
 
         // Client
@@ -362,6 +494,7 @@ mod tests {
             info_hash: expected_info_hash,
             peer_id: local_peer_id,
             supports_extension: false,
+            supports_fast: false,
         };
         hs_client.write_to(&mut stream).unwrap();
 
@@ -426,6 +559,7 @@ mod tests {
                 info_hash: expected_info_hash,
                 peer_id: my_peer_id, // Same peer_id
                 supports_extension: false,
+                supports_fast: false,
             };
             hs.write_to(&mut stream).unwrap();
         });

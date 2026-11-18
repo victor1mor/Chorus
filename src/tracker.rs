@@ -4,7 +4,7 @@ use crate::rede::{ip_proibido, validar_url};
 use crate::tracker_udp::UdpTracker;
 use anyhow::{Result, anyhow, ensure};
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use url::Url;
 
 const MAX_RESPONSE: usize = 1024 * 1024;
@@ -44,6 +44,16 @@ pub struct TrackerRequest {
 pub struct TrackerResponse {
     pub interval: u32,
     pub peers: Vec<SocketAddrV4>,
+    /// BEP 7: IPv6 peers (`peers6` over HTTP, 18-byte entries over UDP on IPv6).
+    pub peers6: Vec<SocketAddrV6>,
+}
+
+impl TrackerResponse {
+    /// IPv4 peers first, then IPv6.
+    pub fn todos(self) -> impl Iterator<Item = SocketAddr> {
+        let v6 = self.peers6.into_iter().map(SocketAddr::V6);
+        self.peers.into_iter().map(SocketAddr::V4).chain(v6)
+    }
 }
 
 pub enum Tracker {
@@ -174,13 +184,52 @@ fn parse_response(bytes: &[u8], rede_protegida: bool) -> Result<TrackerResponse>
         _ => return Err(anyhow!("Missing or invalid interval in tracker response")),
     };
 
-    let Some((BValue::Bytes(peers_bytes), _, _)) = dict.get(b"peers".as_slice()) else {
-        return Err(anyhow!(
-            "Tracker response requires a compact IPv4 peers list"
-        ));
+    let v4 = dict.get(b"peers".as_slice());
+    let v6 = dict.get(b"peers6".as_slice());
+    let peers = match v4 {
+        Some((BValue::Bytes(bytes), _, _)) => compact_peers(bytes, rede_protegida)?,
+        None if v6.is_some() => Vec::new(),
+        _ => {
+            return Err(anyhow!(
+                "Tracker response requires a compact IPv4 peers list"
+            ));
+        }
     };
-    let peers = compact_peers(peers_bytes, rede_protegida)?;
-    Ok(TrackerResponse { interval, peers })
+    let mut peers6 = match v6 {
+        Some((BValue::Bytes(bytes), _, _)) => compact_peers6(bytes, rede_protegida)?,
+        None => Vec::new(),
+        _ => return Err(anyhow!("Tracker peers6 must be a compact string")),
+    };
+    peers6.truncate(MAX_PEERS.saturating_sub(peers.len()));
+    Ok(TrackerResponse {
+        interval,
+        peers,
+        peers6,
+    })
+}
+
+/// BEP 7 compact IPv6 peers: 16 bytes of address and 2 of port, with the same filter as IPv4.
+pub fn compact_peers6(bytes: &[u8], rede_protegida: bool) -> Result<Vec<SocketAddrV6>> {
+    let (entries, remainder) = bytes.as_chunks::<18>();
+    ensure!(
+        remainder.is_empty(),
+        "Compact IPv6 peers length is not a multiple of 18"
+    );
+    let mut seen = HashSet::new();
+    Ok(entries
+        .iter()
+        .map(|entry| {
+            let ip = Ipv6Addr::from(<[u8; 16]>::try_from(&entry[..16]).unwrap());
+            SocketAddrV6::new(ip, u16::from_be_bytes([entry[16], entry[17]]), 0, 0)
+        })
+        .filter(|peer| {
+            peer.port() != 0
+                && !peer.ip().is_unspecified()
+                && (!rede_protegida || !ip_proibido((*peer.ip()).into()))
+                && seen.insert(*peer)
+        })
+        .take(MAX_PEERS)
+        .collect())
 }
 
 pub fn compact_peers(bytes: &[u8], rede_protegida: bool) -> Result<Vec<SocketAddrV4>> {
@@ -370,6 +419,63 @@ mod tests {
             ["8.8.8.8:257".parse()?]
         );
         assert_eq!(parse_response(&response, false)?.peers.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn f17_peers6_bep7_com_e_sem_ipv4() -> Result<()> {
+        let mut v6 = Vec::new();
+        for (ip, port) in [
+            ("2001:db8::1", 6881u16),
+            ("::1", 1),
+            ("fd00::1", 2),
+            ("2001:db8::1", 6881),
+            ("::", 3),
+        ] {
+            v6.extend_from_slice(&ip.parse::<Ipv6Addr>()?.octets());
+            v6.extend_from_slice(&port.to_be_bytes());
+        }
+        let mut so_v6 = format!("d8:intervali60e6:peers6{}:", v6.len()).into_bytes();
+        so_v6.extend_from_slice(&v6);
+        so_v6.push(b'e');
+        let resposta = parse_response(&so_v6, true)?;
+        assert!(resposta.peers.is_empty());
+        assert_eq!(
+            resposta.peers6,
+            ["[2001:db8::1]:6881".parse::<SocketAddrV6>()?]
+        );
+        assert_eq!(
+            parse_response(&so_v6, false)?.peers6.len(),
+            3,
+            "loopback e ULA fora só na rede protegida"
+        );
+        let mut ambos = b"d8:intervali60e5:peers6:".to_vec();
+        ambos.extend_from_slice(&[8, 8, 8, 8, 0x1a, 0xe1]);
+        ambos.extend_from_slice(format!("6:peers6{}:", v6.len()).as_bytes());
+        ambos.extend_from_slice(&v6);
+        ambos.push(b'e');
+        let todos: Vec<SocketAddr> = parse_response(&ambos, true)?.todos().collect();
+        assert_eq!(
+            todos,
+            [
+                "8.8.8.8:6881".parse::<SocketAddr>()?,
+                "[2001:db8::1]:6881".parse()?
+            ]
+        );
+        let mut torto = b"d8:intervali60e6:peers617:".to_vec();
+        torto.extend_from_slice(&[0; 17]);
+        torto.push(b'e');
+        assert!(
+            parse_response(&torto, false)
+                .unwrap_err()
+                .to_string()
+                .contains("multiple of 18")
+        );
+        assert!(
+            parse_response(b"d8:intervali60ee", false).is_err(),
+            "sem peers nem peers6"
+        );
+        println!("BEP 7: peers6 sozinho, junto com peers, filtrado e com tamanho conferido");
         Ok(())
     }
 }

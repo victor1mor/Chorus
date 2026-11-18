@@ -12,6 +12,8 @@ pub struct Metainfo {
     pub info: Info,
     pub private: bool,
     pub nodes: Vec<String>,
+    /// BEP 19 `url-list` (a string or a list of strings), outside `info`.
+    pub url_list: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +94,15 @@ impl Metainfo {
             return Err(anyhow!("torrent total length must be positive"));
         }
 
+        let texto = |valor: &BValue| match valor {
+            BValue::Bytes(bytes) => String::from_utf8(bytes.clone()).ok(),
+            _ => None,
+        };
+        let url_list = match dict.get(b"url-list".as_slice()) {
+            Some((BValue::List(urls), _, _)) => urls.iter().filter_map(texto).collect(),
+            Some((valor, _, _)) => texto(valor).into_iter().collect(),
+            None => Vec::new(),
+        };
         let nodes = match dict.get(b"nodes".as_slice()) {
             Some((BValue::List(nodes), _, _)) => nodes
                 .iter()
@@ -118,6 +129,7 @@ impl Metainfo {
             info,
             private: get_int_opt(info_dict, b"private") == Some(1),
             nodes,
+            url_list,
         })
     }
 

@@ -39,6 +39,7 @@ impl MetadataTransfer {
             info_hash: *info_hash,
             peer_id: *local_peer_id,
             supports_extension: true,
+            supports_fast: false,
         };
         prepare_write(reader.stream)?;
         hs.write_to(reader.stream)?;
@@ -186,6 +187,7 @@ mod tests {
                 info_hash,
                 peer_id: remote_peer_id,
                 supports_extension: true,
+                supports_fast: false,
             };
             hs_reply.write_to(&mut stream).unwrap();
 
@@ -258,6 +260,7 @@ mod tests {
                 info_hash: hash,
                 peer_id: [2; 20],
                 supports_extension: true,
+                supports_fast: false,
             }
             .write_to(&mut peer)
             .unwrap();

@@ -171,7 +171,12 @@ fn handshake(listener: &TcpListener, hash: [u8; 20], metadata: bool) -> TcpStrea
     stream.read_exact(&mut handshake).unwrap();
     assert_eq!(&handshake[..20], b"\x13BitTorrent protocol");
     assert_eq!(&handshake[28..48], &hash);
-    assert_eq!(handshake[25] & 0x10 != 0, metadata);
+    assert_eq!(handshake[25] & 0x10, 0x10, "BEP 10 bit");
+    // Only the download connection offers BEP 6.
+    assert_eq!(handshake[27] & 0x04 != 0, !metadata);
+    if !metadata {
+        handshake[20..28].fill(0); // plain BitTorrent peer
+    }
     handshake[48..].fill(b'S');
     stream.write_all(&handshake).unwrap();
     stream

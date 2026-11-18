@@ -1,6 +1,6 @@
 [package]
 name = "Chorus"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.99"
 description = "A concurrent HTTP(S) and BitTorrent downloader."
@@ -24,3 +24,4 @@ url = "2.5.8"
 
 [dev-dependencies]
 proptest = "1.11.0"
+tokio = { version = "1.54.1", features = ["test-util"] }
